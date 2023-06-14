@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/TikTokTechImmersion/assignment_demo_2023/http-server/kitex_gen/rpc"
@@ -25,7 +27,7 @@ func main() {
 	}
 	cli = imservice.MustNewClient("demo.rpc.server",
 		client.WithResolver(r),
-		client.WithRPCTimeout(1*time.Second),
+		client.WithRPCTimeout(1*time.Second), // was changed from 1 to 10 seconds
 		client.WithHostPorts("rpc-server:8888"),
 	)
 
@@ -42,17 +44,26 @@ func main() {
 }
 
 func sendMessage(ctx context.Context, c *app.RequestContext) {
-	var req api.SendRequest
-	err := c.Bind(&req)
-	if err != nil {
-		c.String(consts.StatusBadRequest, "Failed to parse request body: %v", err)
-		return
+	sender, hasSender := c.GetQuery("sender")
+	receiver, hasReceiver := c.GetQuery("receiver")
+	text, hasText := c.GetQuery("text")
+	if !hasSender || !hasReceiver || !hasText {
+		c.String(consts.StatusBadRequest, "Failed to parse request body")
 	}
+
+	chatId := ""
+	if strings.Compare(sender, receiver) <= 0 {
+		chatId = sender + ":" + receiver
+	} else {
+		chatId = receiver + ":" + sender
+	}
+
 	resp, err := cli.Send(ctx, &rpc.SendRequest{
 		Message: &rpc.Message{
-			Chat:   req.Chat,
-			Text:   req.Text,
-			Sender: req.Sender,
+			Chat:     chatId,
+			Text:     text,
+			Sender:   sender,
+			SendTime: time.Now().Unix(),
 		},
 	})
 	if err != nil {
@@ -65,26 +76,44 @@ func sendMessage(ctx context.Context, c *app.RequestContext) {
 }
 
 func pullMessage(ctx context.Context, c *app.RequestContext) {
-	var req api.PullRequest
-	err := c.Bind(&req)
-	if err != nil {
-		c.String(consts.StatusBadRequest, "Failed to parse request body: %v", err)
-		return
+	chatInput, hasChat := c.GetQuery("chat")
+	startInput, hasStart := c.GetQuery("start") //start should be 0-indexed
+	countInput, hasCount := c.GetQuery("count") // number of messages expected
+	reverseInput, hasReverse := c.GetQuery("reverse")
+	if !hasChat {
+		c.String(consts.StatusBadRequest, "Chat ID needed")
+	}
+
+	var err error
+	count := 10
+	reverse := false
+	if hasCount {
+		count, err = strconv.Atoi(countInput)
+	}
+	if hasReverse && reverseInput == "true" {
+		reverse = true
+	}
+	start := 0
+	if hasStart {
+		start, err = strconv.Atoi(startInput)
+	} else if hasReverse {
+		start = -1
 	}
 
 	resp, err := cli.Pull(ctx, &rpc.PullRequest{
-		Chat:    req.Chat,
-		Cursor:  req.Cursor,
-		Limit:   req.Limit,
-		Reverse: &req.Reverse,
+		Chat:    chatInput,
+		Cursor:  int64(start),
+		Limit:   int32(count),
+		Reverse: &reverse,
 	})
 	if err != nil {
 		c.String(consts.StatusInternalServerError, err.Error())
 		return
-	} else if resp.Code != 0 {
+	} else if resp.Code == 0 {
 		c.String(consts.StatusInternalServerError, resp.Msg)
 		return
 	}
+
 	messages := make([]*api.Message, 0, len(resp.Messages))
 	for _, msg := range resp.Messages {
 		messages = append(messages, &api.Message{
@@ -94,6 +123,7 @@ func pullMessage(ctx context.Context, c *app.RequestContext) {
 			SendTime: msg.SendTime,
 		})
 	}
+
 	c.JSON(consts.StatusOK, &api.PullResponse{
 		Messages:   messages,
 		HasMore:    resp.GetHasMore(),
